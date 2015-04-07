@@ -20,13 +20,12 @@
 #include "streaming.h"
 #include "timeshift.h"
 #include "timeshift/private.h"
-#include "config2.h"
+#include "config.h"
 #include "settings.h"
 #include "atomic.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/epoll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
@@ -42,6 +41,18 @@ int       timeshift_unlimited_period;
 uint32_t  timeshift_max_period;
 int       timeshift_unlimited_size;
 uint64_t  timeshift_max_size;
+uint64_t  timeshift_ram_size;
+uint64_t  timeshift_ram_segment_size;
+int       timeshift_ram_only;
+
+/*
+ * Safe values for RAM configuration
+ */
+static void timeshift_fixup ( void )
+{
+  if (timeshift_ram_only)
+    timeshift_max_size = timeshift_ram_size;
+}
 
 /*
  * Intialise global file manager
@@ -62,6 +73,8 @@ void timeshift_init ( void )
   timeshift_max_period       = 3600;                    // 1Hr
   timeshift_unlimited_size   = 0;
   timeshift_max_size         = 10000 * (size_t)1048576; // 10G
+  timeshift_ram_size         = 0;
+  timeshift_ram_segment_size = 0;
 
   /* Load settings */
   if ((m = hts_settings_load("timeshift/config"))) {
@@ -78,7 +91,14 @@ void timeshift_init ( void )
       timeshift_unlimited_size = u32 ? 1 : 0;
     if (!htsmsg_get_u32(m, "max_size", &u32))
       timeshift_max_size = 1048576LL * u32;
+    if (!htsmsg_get_u32(m, "ram_size", &u32)) {
+      timeshift_ram_size = 1048576LL * u32;
+      timeshift_ram_segment_size = timeshift_ram_size / 10;
+    }
+    if (!htsmsg_get_u32(m, "ram_only", &u32))
+      timeshift_ram_only = u32 ? 1 : 0;
     htsmsg_destroy(m);
+    timeshift_fixup();
   }
 }
 
@@ -88,6 +108,8 @@ void timeshift_init ( void )
 void timeshift_term ( void )
 {
   timeshift_filemgr_term();
+  free(timeshift_path);
+  timeshift_path = NULL;
 }
 
 /*
@@ -96,6 +118,8 @@ void timeshift_term ( void )
 void timeshift_save ( void )
 {
   htsmsg_t *m;
+
+  timeshift_fixup();
 
   m = htsmsg_create_map();
   htsmsg_add_u32(m, "enabled", timeshift_enabled);
@@ -106,8 +130,41 @@ void timeshift_save ( void )
   htsmsg_add_u32(m, "max_period", timeshift_max_period);
   htsmsg_add_u32(m, "unlimited_size", timeshift_unlimited_size);
   htsmsg_add_u32(m, "max_size", timeshift_max_size / 1048576);
+  htsmsg_add_u32(m, "ram_size", timeshift_ram_size / 1048576);
+  htsmsg_add_u32(m, "ram_only", timeshift_ram_only);
 
   hts_settings_save(m, "timeshift/config");
+}
+
+/*
+ * Decode initial time diff
+ *
+ * Gather some packets and select the lowest pts to identify
+ * the correct start. Note that for timeshift, the tsfix
+ * stream plugin is applied, so the starting pts should be
+ * near zero. If not - it's a bug.
+ */
+static void
+timeshift_set_pts_delta ( timeshift_t *ts, int64_t pts )
+{
+  int i;
+  int64_t smallest = INT64_MAX;
+
+  if (pts == PTS_UNSET)
+    return;
+
+  for (i = 0; i < ARRAY_SIZE(ts->pts_val); i++) {
+    int64_t i64 = ts->pts_val[i];
+    if (i64 == PTS_UNSET) {
+      ts->pts_val[i] = pts;
+      break;
+    }
+    if (i64 < smallest)
+      smallest = i64;
+  }
+
+  if (i >= ARRAY_SIZE(ts->pts_val))
+    ts->pts_delta = getmonoclock() - ts_rescale(smallest, 1000000);
 }
 
 /*
@@ -118,6 +175,7 @@ static void timeshift_input
 {
   int exit = 0;
   timeshift_t *ts = opaque;
+  th_pkt_t *pkt = sm->sm_data;
 
   pthread_mutex_lock(&ts->state_mutex);
 
@@ -137,6 +195,19 @@ static void timeshift_input
       ts->state  = TS_LIVE;
     }
 
+    if (sm->sm_type == SMT_PACKET) {
+      tvhtrace("timeshift",
+               "ts %d pkt in  - stream %d type %c pts %10"PRId64
+               " dts %10"PRId64" dur %10d len %zu",
+               ts->id,
+               pkt->pkt_componentindex,
+               pkt_frametype_to_char(pkt->pkt_frametype),
+               ts_rescale(pkt->pkt_pts, 1000000),
+               ts_rescale(pkt->pkt_dts, 1000000),
+               pkt->pkt_duration,
+               pktbuf_len(pkt->pkt_payload));
+    }
+
     /* Pass-thru */
     if (ts->state <= TS_LIVE) {
       if (sm->sm_type == SMT_START) {
@@ -154,15 +225,24 @@ static void timeshift_input
       exit = 1;
 
     /* Record (one-off) PTS delta */
-    if (sm->sm_type == SMT_PACKET && ts->pts_delta == PTS_UNSET) {
-      th_pkt_t *pkt = sm->sm_data;
-      if (pkt->pkt_pts != PTS_UNSET)
-        ts->pts_delta = getmonoclock() - ts_rescale(pkt->pkt_pts, 1000000);
-    }
+    if (sm->sm_type == SMT_PACKET && ts->pts_delta == PTS_UNSET)
+      timeshift_set_pts_delta(ts, pkt->pkt_pts);
 
     /* Buffer to disk */
     if ((ts->state > TS_LIVE) || (!ts->ondemand && (ts->state == TS_LIVE))) {
       sm->sm_time = getmonoclock();
+      if (sm->sm_type == SMT_PACKET) {
+        tvhtrace("timeshift",
+                 "ts %d pkt buf - stream %d type %c pts %10"PRId64
+                 " dts %10"PRId64" dur %10d len %zu",
+                 ts->id,
+                 pkt->pkt_componentindex,
+                 pkt_frametype_to_char(pkt->pkt_frametype),
+                 ts_rescale(pkt->pkt_pts, 1000000),
+                 ts_rescale(pkt->pkt_dts, 1000000),
+                 pkt->pkt_duration,
+                 pktbuf_len(pkt->pkt_payload));
+      }
       streaming_target_deliver2(&ts->wr_queue.sq_st, sm);
     } else
       streaming_msg_free(sm);
@@ -230,6 +310,7 @@ streaming_target_t *timeshift_create
   (streaming_target_t *out, time_t max_time)
 {
   timeshift_t *ts = calloc(1, sizeof(timeshift_t));
+  int i;
 
   /* Must hold global lock */
   lock_assert(&global_lock);
@@ -245,6 +326,8 @@ streaming_target_t *timeshift_create
   ts->id         = timeshift_index;
   ts->ondemand   = timeshift_ondemand;
   ts->pts_delta  = PTS_UNSET;
+  for (i = 0; i < ARRAY_SIZE(ts->pts_val); i++)
+    ts->pts_val[i] = PTS_UNSET;
   pthread_mutex_init(&ts->rdwr_mutex, NULL);
   pthread_mutex_init(&ts->state_mutex, NULL);
 
@@ -252,10 +335,10 @@ streaming_target_t *timeshift_create
   tvh_pipe(O_NONBLOCK, &ts->rd_pipe);
 
   /* Initialise input */
-  streaming_queue_init(&ts->wr_queue, 0);
+  streaming_queue_init(&ts->wr_queue, 0, 0);
   streaming_target_init(&ts->input, timeshift_input, ts, 0);
-  pthread_create(&ts->wr_thread, NULL, timeshift_writer, ts);
-  pthread_create(&ts->rd_thread, NULL, timeshift_reader, ts);
+  tvhthread_create(&ts->wr_thread, NULL, timeshift_writer, ts);
+  tvhthread_create(&ts->rd_thread, NULL, timeshift_reader, ts);
 
   /* Update index */
   timeshift_index++;

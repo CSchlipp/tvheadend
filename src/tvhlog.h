@@ -18,23 +18,42 @@
 #ifndef __TVH_LOGGING_H__
 #define __TVH_LOGGING_H__
 
+#include <sys/types.h>
+#include "build.h"
+#if ENABLE_ANDROID
+#include <syslog.h>
+#else
 #include <sys/syslog.h>
+#endif
 #include <pthread.h>
 #include <stdarg.h>
 
 #include "htsmsg.h"
 
+typedef struct {
+  time_t last;
+  size_t count;
+} tvhlog_limit_t;
+
+/* Globals */
+extern time_t           dispatch_clock;
+
 /* Config */
 extern int              tvhlog_level;
-extern htsmsg_t        *tvhlog_subsys;
+extern htsmsg_t        *tvhlog_debug;
+extern htsmsg_t        *tvhlog_trace;
 extern char            *tvhlog_path;
 extern int              tvhlog_options;
 extern pthread_mutex_t  tvhlog_mutex;
 
 /* Initialise */
 void tvhlog_init       ( int level, int options, const char *path ); 
-void tvhlog_set_subsys ( const char *subsys );
-void tvhlog_get_subsys ( char *subsys, size_t len );
+void tvhlog_start      ( void );
+void tvhlog_end        ( void );
+void tvhlog_set_debug  ( const char *subsys );
+void tvhlog_get_debug  ( char *subsys, size_t len );
+void tvhlog_set_trace  ( const char *subsys );
+void tvhlog_get_trace  ( char *subsys, size_t len );
 void tvhlogv           ( const char *file, int line,
                          int notify, int severity,
                          const char *subsys, const char *fmt, va_list *args );
@@ -46,6 +65,12 @@ void _tvhlog_hexdump   ( const char *file, int line,
                          int notify, int severity,
                          const char *subsys,
                          const uint8_t *data, ssize_t len );
+static inline void tvhlog_limit_reset ( tvhlog_limit_t *limit )
+  { limit->last = 0; limit->count = 0; }
+static inline int tvhlog_limit ( tvhlog_limit_t *limit, uint32_t delay )
+  { time_t t = dispatch_clock; limit->count++;
+    if (limit->last + delay < t) { limit->last = t; return 1; }
+    return 0; }
 
 
 /* Options */
@@ -57,6 +82,7 @@ void _tvhlog_hexdump   ( const char *file, int line,
 #define TVHLOG_OPT_MILLIS       0x0100
 #define TVHLOG_OPT_DECORATE     0x0200
 #define TVHLOG_OPT_FILELINE     0x0400
+#define TVHLOG_OPT_THREAD       0x0800
 #define TVHLOG_OPT_ALL          0xFFFF
 
 /* Levels */
@@ -78,5 +104,16 @@ void _tvhlog_hexdump   ( const char *file, int line,
 #define tvhtrace(...) (void)0
 #define tvhlog_hexdump(...) (void)0
 #endif
+
+#define tvhftrace(subsys, fcn) do { \
+  tvhtrace(subsys, "%s() enter", #fcn); \
+  fcn(); \
+  tvhtrace(subsys, "%s() leave", #fcn); \
+} while (0)
+
+#define tvhdebug(...) tvhlog(LOG_DEBUG,   ##__VA_ARGS__)
+#define tvhinfo(...)  tvhlog(LOG_INFO,    ##__VA_ARGS__)
+#define tvhwarn(...)  tvhlog(LOG_WARNING, ##__VA_ARGS__)
+#define tvherror(...) tvhlog(LOG_ERR,     ##__VA_ARGS__)
 
 #endif /* __TVH_LOGGING_H__ */

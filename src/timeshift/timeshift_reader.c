@@ -21,39 +21,63 @@
 #include "timeshift.h"
 #include "timeshift/private.h"
 #include "atomic.h"
+#include "tvhpoll.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/epoll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
 #include <assert.h>
 
+#if ENABLE_EPOLL
+#include <sys/epoll.h>
+#elif ENABLE_KQUEUE
+#include <sys/event.h>
+#include <sys/time.h>
+#endif
+
 /* **************************************************************************
  * File Reading
  * *************************************************************************/
 
-static ssize_t _read_pktbuf ( int fd, pktbuf_t **pktbuf )
+static ssize_t _read_buf ( timeshift_file_t *tsf, int fd, void *buf, size_t size )
+{
+  if (tsf && tsf->ram) {
+    if (tsf->roff + size > tsf->woff) return -1;
+    pthread_mutex_lock(&tsf->ram_lock);
+    memcpy(buf, tsf->ram + tsf->roff, size);
+    tsf->roff += size;
+    pthread_mutex_unlock(&tsf->ram_lock);
+    return size;
+  } else {
+    size = read(tsf ? tsf->rfd : fd, buf, size);
+    if (size > 0 && tsf)
+      tsf->roff += size;
+    return size;
+  }
+}
+
+static ssize_t _read_pktbuf ( timeshift_file_t *tsf, int fd, pktbuf_t **pktbuf )
 {
   ssize_t r, cnt = 0;
   size_t sz;
 
   /* Size */
-  r = read(fd, &sz, sizeof(sz));
+  r = _read_buf(tsf, fd, &sz, sizeof(sz));
   if (r < 0) return -1;
   if (r != sizeof(sz)) return 0;
   cnt += r;
 
-  /* Empty */
-  if (!sz) {
+  /* Empty And Sanity Check */
+  if (!sz || sz > 1024 * 1024) {
     *pktbuf = NULL;
     return cnt;
   }
 
   /* Data */
   *pktbuf = pktbuf_alloc(NULL, sz);
-  r = read(fd, (*pktbuf)->pb_data, sz);
+  r = _read_buf(tsf, fd, (*pktbuf)->pb_data, sz);
   if (r != sz) {
     free((*pktbuf)->pb_data);
     free(*pktbuf);
@@ -65,7 +89,7 @@ static ssize_t _read_pktbuf ( int fd, pktbuf_t **pktbuf )
 }
 
 
-static ssize_t _read_msg ( int fd, streaming_message_t **sm )
+static ssize_t _read_msg ( timeshift_file_t *tsf, int fd, streaming_message_t **sm )
 {
   ssize_t r, cnt = 0;
   size_t sz;
@@ -78,7 +102,7 @@ static ssize_t _read_msg ( int fd, streaming_message_t **sm )
   *sm = NULL;
 
   /* Size */
-  r = read(fd, &sz, sizeof(sz));
+  r = _read_buf(tsf, fd, &sz, sizeof(sz));
   if (r < 0) return -1;
   if (r != sizeof(sz)) return 0;
   cnt += r;
@@ -86,14 +110,17 @@ static ssize_t _read_msg ( int fd, streaming_message_t **sm )
   /* EOF */
   if (sz == 0) return cnt;
 
+  /* Wrong data size */
+  if (sz > 1024 * 1024) return -1;
+
   /* Type */
-  r = read(fd, &type, sizeof(type));
+  r = _read_buf(tsf, fd, &type, sizeof(type));
   if (r < 0) return -1;
   if (r != sizeof(type)) return 0;
   cnt += r;
 
   /* Time */
-  r = read(fd, &time, sizeof(time));
+  r = _read_buf(tsf, fd, &time, sizeof(time));
   if (r < 0) return -1;
   if (r != sizeof(time)) return 0;
   cnt += r;
@@ -117,7 +144,7 @@ static ssize_t _read_msg ( int fd, streaming_message_t **sm )
     case SMT_EXIT:
     case SMT_SPEED:
       if (sz != sizeof(code)) return -1;
-      r = read(fd, &code, sz);
+      r = _read_buf(tsf, fd, &code, sz);
       if (r != sz) {
         if (r < 0) return -1;
         return 0;
@@ -131,7 +158,7 @@ static ssize_t _read_msg ( int fd, streaming_message_t **sm )
     case SMT_MPEGTS:
     case SMT_PACKET:
       data = malloc(sz);
-      r = read(fd, data, sz);
+      r = _read_buf(tsf, fd, data, sz);
       if (r != sz) {
         free(data);
         if (r < 0) return -1;
@@ -139,16 +166,16 @@ static ssize_t _read_msg ( int fd, streaming_message_t **sm )
       }
       if (type == SMT_PACKET) {
         th_pkt_t *pkt = data;
-        pkt->pkt_payload  = pkt->pkt_header = NULL;
+        pkt->pkt_payload  = pkt->pkt_meta = NULL;
         pkt->pkt_refcount = 0;
         *sm = streaming_msg_create_pkt(pkt);
-        r   = _read_pktbuf(fd, &pkt->pkt_header);
+        r   = _read_pktbuf(tsf, fd, &pkt->pkt_meta);
         if (r < 0) {
           streaming_msg_free(*sm);
           return r;
         }
         cnt += r;
-        r   = _read_pktbuf(fd, &pkt->pkt_payload);
+        r   = _read_pktbuf(tsf, fd, &pkt->pkt_payload);
         if (r < 0) {
           streaming_msg_free(*sm);
           return r;
@@ -307,48 +334,64 @@ static int _timeshift_skip
  * Output packet
  */
 static int _timeshift_read
-  ( timeshift_t *ts, timeshift_file_t **cur_file, off_t *cur_off, int *fd,
+  ( timeshift_t *ts, timeshift_file_t **cur_file,
     streaming_message_t **sm, int *wait )
 {
-  if (*cur_file) {
+  timeshift_file_t *tsf = *cur_file;
+  ssize_t r;
+  off_t off, ooff;
+
+  if (tsf) {
 
     /* Open file */
-    if (*fd == -1) {
-      tvhtrace("timeshift", "ts %d open file %s",
-               ts->id, (*cur_file)->path);
-      *fd = open((*cur_file)->path, O_RDONLY);
+    if (tsf->rfd < 0 && !tsf->ram) {
+      tsf->rfd = open(tsf->path, O_RDONLY);
+      tvhtrace("timeshift", "ts %d open file %s (fd %i)", ts->id, tsf->path, tsf->rfd);
+      if (tsf->rfd < 0)
+        return -1;
     }
-    tvhtrace("timeshift", "ts %d seek to %"PRIoff_t, ts->id, *cur_off);
-    lseek(*fd, *cur_off, SEEK_SET);
+    tvhtrace("timeshift", "ts %d seek to %jd (fd %i)", ts->id, tsf->roff, tsf->rfd);
+    if (tsf->rfd >= 0)
+      if ((off = lseek(tsf->rfd, tsf->roff, SEEK_SET)) != tsf->roff)
+        tvherror("timeshift", "seek to %s failed (off %"PRId64" != %"PRId64"): %s",
+                 tsf->path, (int64_t)tsf->roff, (int64_t)off, strerror(errno));
 
     /* Read msg */
-    ssize_t r = _read_msg(*fd, sm);
+    ooff = tsf->roff;
+    r = _read_msg(tsf, -1, sm);
     if (r < 0) {
       streaming_message_t *e = streaming_msg_create_code(SMT_STOP, SM_CODE_UNDEFINED_ERROR);
       streaming_target_deliver2(ts->output, e);
       tvhlog(LOG_ERR, "timeshift", "ts %d could not read buffer", ts->id);
       return -1;
     }
-    tvhtrace("timeshift", "ts %d read msg %p (%"PRIssize_t")",
-             ts->id, *sm, r);
+#if ENABLE_ANDROID
+    tvhtrace("timeshift", "ts %d read msg %p (%ld)", ts->id, *sm, r);  // Android bug, ssize_t is long int
+#else
+    tvhtrace("timeshift", "ts %d read msg %p (%zd)", ts->id, *sm, r);
+#endif
 
     /* Incomplete */
     if (r == 0) {
-      lseek(*fd, *cur_off, SEEK_SET);
+      if (tsf->rfd >= 0) {
+        tvhtrace("timeshift", "ts %d seek to %jd (fd %i) (incomplete)", ts->id, tsf->roff, tsf->rfd);
+        if ((off = lseek(tsf->rfd, ooff, SEEK_SET)) != ooff)
+          tvherror("timeshift", "seek to %s failed (off %"PRId64" != %"PRId64"): %s",
+                   tsf->path, (int64_t)ooff, (int64_t)off, strerror(errno));
+      }
+      tsf->roff = ooff;
       return 0;
     }
 
-    /* Update */
-    *cur_off += r;
-
     /* Special case - EOF */
-    if (r == sizeof(size_t) || *cur_off > (*cur_file)->size) {
-      close(*fd);
-      *fd       = -1;
+    if (r == sizeof(size_t) || tsf->roff > tsf->size) {
+      if (tsf->rfd >= 0)
+        close(tsf->rfd);
+      tsf->rfd  = -1;
       pthread_mutex_lock(&ts->rdwr_mutex);
-      *cur_file = timeshift_filemgr_next(*cur_file, NULL, 0);
+      *cur_file = timeshift_filemgr_next(tsf, NULL, 0);
       pthread_mutex_unlock(&ts->rdwr_mutex);
-      *cur_off  = 0; // reset
+      tsf->roff = 0; // reset
       *wait     = 0;
 
     /* Check SMT_START index */
@@ -371,12 +414,12 @@ static int _timeshift_read
  * Flush all data to live
  */
 static int _timeshift_flush_to_live
-  ( timeshift_t *ts, timeshift_file_t **cur_file, off_t *cur_off, int *fd,
+  ( timeshift_t *ts, timeshift_file_t **cur_file,
     streaming_message_t **sm, int *wait )
 {
   time_t pts = 0;
   while (*cur_file) {
-    if (_timeshift_read(ts, cur_file, cur_off, fd, sm, wait) == -1)
+    if (_timeshift_read(ts, cur_file, sm, wait) == -1)
       return -1;
     if (!*sm) break;
     if ((*sm)->sm_type == SMT_PACKET) {
@@ -394,15 +437,15 @@ static int _timeshift_flush_to_live
  * Thread
  * *************************************************************************/
 
+
 /*
  * Timeshift thread
  */
 void *timeshift_reader ( void *p )
 {
   timeshift_t *ts = p;
-  int efd, nfds, end, fd = -1, run = 1, wait = -1;
+  int nfds, end, run = 1, wait = -1;
   timeshift_file_t *cur_file = NULL;
-  off_t cur_off = 0;
   int cur_speed = 100, keyframe_mode = 0;
   int64_t pause_time = 0, play_time = 0, last_time = 0;
   int64_t now, deliver, skip_time = 0;
@@ -410,13 +453,13 @@ void *timeshift_reader ( void *p )
   timeshift_index_iframe_t *tsi = NULL;
   streaming_skip_t *skip = NULL;
   time_t last_status = 0;
+  tvhpoll_t *pd;
+  tvhpoll_event_t ev = { 0 };
 
-  /* Poll */
-  struct epoll_event ev = { 0 };
-  efd        = epoll_create(1);
-  ev.events  = EPOLLIN;
-  ev.data.fd = ts->rd_pipe.rd;
-  epoll_ctl(efd, EPOLL_CTL_ADD, ev.data.fd, &ev);
+  pd = tvhpoll_create(1);
+  ev.fd     = ts->rd_pipe.rd;
+  ev.events = TVHPOLL_IN;
+  tvhpoll_add(pd, &ev, 1);
 
   /* Output */
   while (run) {
@@ -428,7 +471,7 @@ void *timeshift_reader ( void *p )
 
     /* Wait for data */
     if(wait)
-      nfds = epoll_wait(efd, &ev, 1, wait);
+      nfds = tvhpoll_wait(pd, &ev, 1, wait);
     else
       nfds = 0;
     wait      = -1;
@@ -439,7 +482,7 @@ void *timeshift_reader ( void *p )
     /* Control */
     pthread_mutex_lock(&ts->state_mutex);
     if (nfds == 1) {
-      if (_read_msg(ev.data.fd, &ctrl) > 0) {
+      if (_read_msg(NULL, ts->rd_pipe.rd, &ctrl) > 0) {
 
         /* Exit */
         if (ctrl->sm_type == SMT_EXIT) {
@@ -479,10 +522,10 @@ void *timeshift_reader ( void *p )
                        ts->id);
                 timeshift_writer_flush(ts);
                 pthread_mutex_lock(&ts->rdwr_mutex);
-                if ((cur_file   = timeshift_filemgr_get(ts, 1))) {
-                  cur_off    = cur_file->size;
-                  pause_time = cur_file->last;
-                  last_time  = pause_time;
+                if ((cur_file    = timeshift_filemgr_get(ts, 1))) {
+                  cur_file->roff = cur_file->size;
+                  pause_time     = cur_file->last;
+                  last_time      = pause_time;
                 }
                 pthread_mutex_unlock(&ts->rdwr_mutex);
               }
@@ -561,9 +604,9 @@ void *timeshift_reader ( void *p )
               /* Live playback (stage1) */
               if (ts->state == TS_LIVE) {
                 pthread_mutex_lock(&ts->rdwr_mutex);
-                if ((cur_file   = timeshift_filemgr_get(ts, !ts->ondemand))) {
-                  cur_off    = cur_file->size;
-                  last_time  = cur_file->last;
+                if ((cur_file    = timeshift_filemgr_get(ts, !ts->ondemand))) {
+                  cur_file->roff = cur_file->size;
+                  last_time      = cur_file->last;
                 } else {
                   tvhlog(LOG_ERR, "timeshift", "ts %d failed to get current file", ts->id);
                   skip = NULL;
@@ -680,23 +723,24 @@ void *timeshift_reader ( void *p )
           tvhlog(LOG_DEBUG, "timeshift", "ts %d skip found pkt @ %"PRId64, ts->id, tsi->time);
 
         /* File changed (close) */
-        if ((tsf != cur_file) && (fd != -1)) {
-          close(fd);
-          fd = -1;
+        if ((tsf != cur_file) && cur_file && cur_file->rfd >= 0) {
+          close(cur_file->rfd);
+          cur_file->rfd = -1;
         }
 
         /* Position */
         if (cur_file)
           cur_file->refcount--;
-        cur_file = tsf;
-        if (tsi)
-          cur_off = tsi->pos;
-        else
-          cur_off = 0;
+        if ((cur_file = tsf) != NULL) {
+          if (tsi)
+            cur_file->roff = tsi->pos;
+          else
+            cur_file->roff = 0;
+        }
       }
 
       /* Find packet */
-      if (_timeshift_read(ts, &cur_file, &cur_off, &fd, &sm, &wait) == -1) {
+      if (_timeshift_read(ts, &cur_file, &sm, &wait) == -1) {
         pthread_mutex_unlock(&ts->state_mutex);
         break;
       }
@@ -724,19 +768,23 @@ void *timeshift_reader ( void *p )
                (((cur_speed < 0) && (sm->sm_time >= deliver)) ||
                ((cur_speed > 0) && (sm->sm_time <= deliver))))) {
 
+      if (sm->sm_type == SMT_PACKET) {
 #if ENABLE_TRACE
-      if (skip)
-      {
-        time_t pts = 0;
-        int64_t delta = now - sm->sm_time;
-        if (sm->sm_type == SMT_PACKET)
-          pts = ((th_pkt_t*)sm->sm_data)->pkt_pts;
-        tvhtrace("timeshift", "ts %d deliver %"PRId64" pts=%"PRItime_t " shift=%"PRIu64,
-               ts->id, sm->sm_time, pts, delta);
-      }
+        th_pkt_t *pkt = sm->sm_data;
+        tvhtrace("timeshift",
+                 "ts %d pkt out - stream %d type %c pts %10"PRId64
+                 " dts %10"PRId64 " dur %10d len %zu time %"PRId64,
+                 ts->id,
+                 pkt->pkt_componentindex,
+                 pkt_frametype_to_char(pkt->pkt_frametype),
+                 ts_rescale(pkt->pkt_pts, 1000000),
+                 ts_rescale(pkt->pkt_dts, 1000000),
+                 pkt->pkt_duration,
+                 pktbuf_len(pkt->pkt_payload), sm->sm_time);
 #endif
-      streaming_target_deliver2(ts->output, sm);
+      }
       last_time = sm->sm_time;
+      streaming_target_deliver2(ts->output, sm);
       sm        = NULL;
       wait      = 0;
     } else if (sm) {
@@ -761,15 +809,16 @@ void *timeshift_reader ( void *p )
         cur_speed = 100;
         ctrl      = streaming_msg_create_code(SMT_SPEED, cur_speed);
         streaming_target_deliver2(ts->output, ctrl);
+        ctrl      = NULL;
 
         /* Flush timeshift buffer to live */
-        if (_timeshift_flush_to_live(ts, &cur_file, &cur_off, &fd, &sm, &wait) == -1)
+        if (_timeshift_flush_to_live(ts, &cur_file, &sm, &wait) == -1)
           break;
 
         /* Close file (if open) */
-        if (fd != -1) {
-          close(fd);
-          fd = -1;
+        if (cur_file && cur_file->rfd >= 0) {
+          close(cur_file->rfd);
+          cur_file->rfd = -1;
         }
 
         /* Flush ALL files */
@@ -789,8 +838,8 @@ void *timeshift_reader ( void *p )
         pause_time = last_time;
         ctrl       = streaming_msg_create_code(SMT_SPEED, cur_speed);
         streaming_target_deliver2(ts->output, ctrl);
+        ctrl       = NULL;
       }
-      ctrl = NULL;
 
     /* Flush unwanted */
     } else if (ts->ondemand && cur_file) {
@@ -803,7 +852,11 @@ void *timeshift_reader ( void *p )
   }
 
   /* Cleanup */
-  if (fd != -1) close(fd);
+  tvhpoll_destroy(pd);
+  if (cur_file && cur_file->rfd >= 0) {
+    close(cur_file->rfd);
+    cur_file->rfd = -1;
+  }
   if (sm)       streaming_msg_free(sm);
   if (ctrl)     streaming_msg_free(ctrl);
   tvhtrace("timeshift", "ts %d exit reader thread", ts->id);

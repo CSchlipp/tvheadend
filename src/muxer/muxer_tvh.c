@@ -56,9 +56,9 @@ tvh_muxer_mime(muxer_t* m, const struct streaming_start *ss)
   }
 
   if(has_video)
-    return muxer_container_type2mime(m->m_container, 1);
+    return muxer_container_type2mime(m->m_config.m_type, 1);
   else if(has_audio)
-    return muxer_container_type2mime(m->m_container, 0);
+    return muxer_container_type2mime(m->m_config.m_type, 0);
   else
     return muxer_container_type2mime(MC_UNKNOWN, 0);
 }
@@ -138,7 +138,7 @@ tvh_muxer_open_file(muxer_t *m, const char *filename)
 {
   tvh_muxer_t *tm = (tvh_muxer_t*)m;
   
-  if(mk_mux_open_file(tm->tm_ref, filename)) {
+  if(mk_mux_open_file(tm->tm_ref, filename, tm->m_config.m_file_permissions)) {
     tm->m_errors++;
     return -1;
   }
@@ -155,10 +155,13 @@ tvh_muxer_write_pkt(muxer_t *m, streaming_message_type_t smt, void *data)
 {
   th_pkt_t *pkt = (th_pkt_t*)data;
   tvh_muxer_t *tm = (tvh_muxer_t*)m;
+  int r;
 
   assert(smt == SMT_PACKET);
 
-  if(mk_mux_write_pkt(tm->tm_ref, pkt)) {
+  if((r = mk_mux_write_pkt(tm->tm_ref, pkt)) != 0) {
+    if (MC_IS_EOS_ERROR(r))
+      tm->m_eos = 1;
     tm->m_errors++;
     return -1;
   }
@@ -171,11 +174,12 @@ tvh_muxer_write_pkt(muxer_t *m, streaming_message_type_t smt, void *data)
  * Append meta data when a channel changes its programme
  */
 static int
-tvh_muxer_write_meta(muxer_t *m, struct epg_broadcast *eb)
+tvh_muxer_write_meta(muxer_t *m, struct epg_broadcast *eb,
+                     const char *comment)
 {
   tvh_muxer_t *tm = (tvh_muxer_t*)m;
 
-  if(mk_mux_write_meta(tm->tm_ref, NULL, eb)) {
+  if(mk_mux_write_meta(tm->tm_ref, NULL, eb, comment)) {
     tm->m_errors++;
     return -1;
   }
@@ -210,7 +214,7 @@ tvh_muxer_destroy(muxer_t *m)
   tvh_muxer_t *tm = (tvh_muxer_t*)m;
 
   if(tm->tm_ref)
-    free(tm->tm_ref);
+    mk_mux_destroy(tm->tm_ref);
 
   free(tm);
 }
@@ -220,11 +224,11 @@ tvh_muxer_destroy(muxer_t *m)
  * Create a new builtin muxer
  */
 muxer_t*
-tvh_muxer_create(muxer_container_type_t mc)
+tvh_muxer_create(const muxer_config_t *m_cfg)
 {
   tvh_muxer_t *tm;
 
-  if(mc != MC_MATROSKA)
+  if(m_cfg->m_type != MC_MATROSKA && m_cfg->m_type != MC_WEBM)
     return NULL;
 
   tm = calloc(1, sizeof(tvh_muxer_t));
@@ -238,8 +242,7 @@ tvh_muxer_create(muxer_container_type_t mc)
   tm->m_write_pkt    = tvh_muxer_write_pkt;
   tm->m_close        = tvh_muxer_close;
   tm->m_destroy      = tvh_muxer_destroy;
-  tm->m_container    = mc;
-  tm->tm_ref         = mk_mux_create();
+  tm->tm_ref         = mk_mux_create((muxer_t *)tm, m_cfg->m_type == MC_WEBM);
 
   return (muxer_t*)tm;
 }

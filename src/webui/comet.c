@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #include <openssl/sha.h>
 
 #include "htsmsg.h"
@@ -47,6 +48,7 @@ static pthread_cond_t comet_cond = PTHREAD_COND_INITIALIZER;
 static LIST_HEAD(, comet_mailbox) mailboxes;
 
 int mailbox_tally;
+int comet_running;
 
 typedef struct comet_mailbox {
   char *cmb_boxid; /* SHA-1 hash */
@@ -136,12 +138,19 @@ comet_mailbox_create(void)
 static void
 comet_access_update(http_connection_t *hc, comet_mailbox_t *cmb)
 {
+  extern int access_noacl;
+
   htsmsg_t *m = htsmsg_create_map();
+  const char *username = hc->hc_access ? (hc->hc_access->aa_username ?: "") : "";
 
   htsmsg_add_str(m, "notificationClass", "accessUpdate");
 
-  htsmsg_add_u32(m, "dvr",   !http_access_verify(hc, ACCESS_RECORDER));
-  htsmsg_add_u32(m, "admin", !http_access_verify(hc, ACCESS_ADMIN));
+  if (!access_noacl)
+    htsmsg_add_str(m, "username", username);
+  if (hc->hc_peer_ipstr)
+    htsmsg_add_str(m, "address", hc->hc_peer_ipstr);
+  htsmsg_add_u32(m, "dvr",      !http_access_verify(hc, ACCESS_RECORDER));
+  htsmsg_add_u32(m, "admin",    !http_access_verify(hc, ACCESS_ADMIN));
 
   if(cmb->cmb_messages == NULL)
     cmb->cmb_messages = htsmsg_create_list();
@@ -197,6 +206,10 @@ comet_mailbox_poll(http_connection_t *hc, const char *remain, void *opaque)
     usleep(100000); /* Always sleep 0.1 sec to avoid comet storms */
 
   pthread_mutex_lock(&comet_mutex);
+  if (!comet_running) {
+    pthread_mutex_unlock(&comet_mutex);
+    return 400;
+  }
 
   if(cometid != NULL)
     LIST_FOREACH(cmb, &mailboxes, cmb_link)
@@ -215,8 +228,13 @@ comet_mailbox_poll(http_connection_t *hc, const char *remain, void *opaque)
 
   cmb->cmb_last_used = 0; /* Make sure we're not flushed out */
 
-  if(!im && cmb->cmb_messages == NULL)
+  if(!im && cmb->cmb_messages == NULL) {
     pthread_cond_timedwait(&comet_cond, &comet_mutex, &ts);
+    if (!comet_running) {
+      pthread_mutex_unlock(&comet_mutex);
+      return 400;
+    }
+  }
 
   m = htsmsg_create_map();
   htsmsg_add_str(m, "boxid", cmb->cmb_boxid);
@@ -278,10 +296,24 @@ comet_mailbox_dbg(http_connection_t *hc, const char *remain, void *opaque)
 void
 comet_init(void)
 {
+  pthread_mutex_lock(&comet_mutex);
+  comet_running = 1;
+  pthread_mutex_unlock(&comet_mutex);
   http_path_add("/comet/poll",  NULL, comet_mailbox_poll, ACCESS_WEB_INTERFACE);
   http_path_add("/comet/debug", NULL, comet_mailbox_dbg,  ACCESS_WEB_INTERFACE);
 }
 
+void
+comet_done(void)
+{
+  comet_mailbox_t *cmb;
+
+  pthread_mutex_lock(&comet_mutex);
+  comet_running = 0;
+  while ((cmb = LIST_FIRST(&mailboxes)) != NULL)
+    cmb_destroy(cmb);
+  pthread_mutex_unlock(&comet_mutex);
+}
 
 /**
  *
@@ -293,14 +325,16 @@ comet_mailbox_add_message(htsmsg_t *m, int isdebug)
 
   pthread_mutex_lock(&comet_mutex);
 
-  LIST_FOREACH(cmb, &mailboxes, cmb_link) {
+  if (comet_running) {
+    LIST_FOREACH(cmb, &mailboxes, cmb_link) {
 
-    if(isdebug && !cmb->cmb_debug)
-      continue;
+      if(isdebug && !cmb->cmb_debug)
+        continue;
 
-    if(cmb->cmb_messages == NULL)
-      cmb->cmb_messages = htsmsg_create_list();
-    htsmsg_add_msg(cmb->cmb_messages, NULL, htsmsg_copy(m));
+      if(cmb->cmb_messages == NULL)
+        cmb->cmb_messages = htsmsg_create_list();
+      htsmsg_add_msg(cmb->cmb_messages, NULL, htsmsg_copy(m));
+    }
   }
 
   pthread_cond_broadcast(&comet_cond);

@@ -1,10 +1,10 @@
-#!/bin/bash
+#!/bin/sh
 #
 # Build tarball of the current directory
 #
 
 # Terminate
-function die
+die ()
 {
   echo >&2 "ERROR: $@"
   exit 1

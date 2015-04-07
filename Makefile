@@ -27,12 +27,47 @@ PROG    := $(BUILDDIR)/tvheadend
 # Common compiler flags
 #
 
+CFLAGS  += -g -O2 -Wunused-result
 CFLAGS  += -Wall -Werror -Wwrite-strings -Wno-deprecated-declarations
-CFLAGS  += -Wmissing-prototypes -fms-extensions
-CFLAGS  += -g -funsigned-char -O2 
+CFLAGS  += -Wmissing-prototypes
+CFLAGS  += -fms-extensions -funsigned-char -fno-strict-aliasing
 CFLAGS  += -D_FILE_OFFSET_BITS=64
 CFLAGS  += -I${BUILDDIR} -I${ROOTDIR}/src -I${ROOTDIR}
-LDFLAGS += -lrt -ldl -lpthread -lm
+ifeq ($(CONFIG_ANDROID),yes)
+LDFLAGS += -ldl -lm
+else
+LDFLAGS += -ldl -lpthread -lm
+endif
+ifeq ($(CONFIG_LIBICONV),yes)
+LDFLAGS += -liconv
+endif
+ifeq ($(PLATFORM), darwin)
+LDFLAGS += -framework CoreServices
+else
+ifeq ($(CONFIG_ANDROID),no)
+LDFLAGS += -lrt
+endif
+endif
+
+ifeq ($(COMPILER), clang)
+CFLAGS  += -Wno-microsoft -Qunused-arguments -Wno-unused-function
+CFLAGS  += -Wno-unused-value -Wno-tautological-constant-out-of-range-compare
+CFLAGS  += -Wno-parentheses-equality -Wno-incompatible-pointer-types
+endif
+
+ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
+CFLAGS  += -I${ROOTDIR}/libav_static/build/ffmpeg/include
+LDFLAGS += -L${ROOTDIR}/libav_static/build/ffmpeg/lib -Wl,-Bstatic \
+           -lavresample -lswresample -lswscale \
+           -lavutil -lavformat -lavcodec -lavutil \
+           -lvorbisenc -lvorbis -logg -lx264 -lvpx \
+           -Wl,-Bdynamic -ldl
+endif
+ifeq ($(CONFIG_HDHOMERUN_STATIC),yes)
+CFLAGS  += -I${ROOTDIR}/libhdhomerun_static
+LDFLAGS += -L${ROOTDIR}/libhdhomerun_static/libhdhomerun \
+           -Wl,-Bstatic -lhdhomerun -Wl,-Bdynamic
+endif
 
 vpath %.c $(ROOTDIR)
 vpath %.h $(ROOTDIR)
@@ -59,20 +94,24 @@ ECHO   = printf "%-16s%s\n" $(1) $(2)
 BRIEF  = CC MKBUNDLE CXX
 MSG    = $(subst $(BUILDDIR)/,,$@)
 $(foreach VAR,$(BRIEF), \
-    $(eval $(VAR) = @$$(call ECHO,$(VAR),$$(MSG)); $($(VAR))))
+	$(eval $(VAR) = @$$(call ECHO,$(VAR),$$(MSG)); $($(VAR))))
 endif
 
 #
 # Core
 #
 SRCS =  src/version.c \
+	src/uuid.c \
 	src/main.c \
 	src/tvhlog.c \
+	src/idnode.c \
+	src/prop.c \
 	src/utils.c \
 	src/wrappers.c \
 	src/access.c \
-	src/dtable.c \
 	src/tcp.c \
+	src/udp.c \
+	src/url.c \
 	src/http.c \
 	src/notify.c \
 	src/file.c \
@@ -82,18 +121,10 @@ SRCS =  src/version.c \
 	src/spawn.c \
 	src/packet.c \
 	src/streaming.c \
-	src/teletext.c \
 	src/channels.c \
 	src/subscriptions.c \
 	src/service.c \
-	src/psi.c \
-	src/parsers.c \
-	src/parser_h264.c \
-	src/parser_latm.c \
-	src/tsdemux.c \
-	src/bitstream.c \
 	src/htsp_server.c \
-	src/serviceprobe.c \
 	src/htsmsg.c \
 	src/htsmsg_binary.c \
 	src/htsmsg_json.c \
@@ -105,26 +136,66 @@ SRCS =  src/version.c \
 	src/trap.c \
 	src/avg.c \
 	src/htsstr.c \
-	src/rawtsinput.c \
-	src/iptv_input.c \
-	src/avc.c \
-  src/huffman.c \
-  src/filebundle.c \
-  src/config2.c \
-  src/lang_codes.c \
-  src/lang_str.c \
-  src/imagecache.c \
-  src/tvhtime.c
+        src/tvhpoll.c \
+	src/huffman.c \
+	src/filebundle.c \
+	src/config.c \
+	src/lang_codes.c \
+	src/lang_str.c \
+	src/imagecache.c \
+	src/tvhtime.c \
+	src/service_mapper.c \
+	src/input.c \
+	src/httpc.c \
+	src/rtsp.c \
+	src/fsmonitor.c \
+	src/cron.c \
+	src/esfilter.c \
+	src/intlconv.c \
+	src/profile.c \
+	src/bouquet.c \
+	src/lock.c
+
+SRCS-${CONFIG_UPNP} += \
+	src/upnp.c
+
+# SATIP Server
+SRCS-${CONFIG_SATIP_SERVER} += \
+	src/satip/server.c \
+	src/satip/rtsp.c \
+	src/satip/rtp.c
+
+SRCS += \
+	src/api.c \
+	src/api/api_status.c \
+	src/api/api_idnode.c \
+	src/api/api_input.c \
+	src/api/api_channel.c \
+	src/api/api_service.c \
+	src/api/api_mpegts.c \
+	src/api/api_epg.c \
+	src/api/api_epggrab.c \
+	src/api/api_imagecache.c \
+	src/api/api_esfilter.c \
+	src/api/api_intlconv.c \
+	src/api/api_access.c \
+	src/api/api_dvr.c \
+	src/api/api_caclient.c \
+	src/api/api_profile.c \
+	src/api/api_bouquet.c
+
+SRCS += \
+	src/parsers/parsers.c \
+	src/parsers/bitstream.c \
+	src/parsers/parser_h264.c \
+	src/parsers/parser_latm.c \
+	src/parsers/parser_avc.c \
+	src/parsers/parser_teletext.c \
 
 SRCS += src/epggrab/module.c\
-  src/epggrab/channel.c\
-  src/epggrab/module/pyepg.c\
-  src/epggrab/module/xmltv.c\
-
-SRCS-$(CONFIG_LINUXDVB) += src/epggrab/otamux.c\
-  src/epggrab/module/eit.c \
-  src/epggrab/module/opentv.c \
-  src/epggrab/support/freesat_huffman.c \
+	src/epggrab/channel.c\
+	src/epggrab/module/pyepg.c\
+	src/epggrab/module/xmltv.c\
 
 SRCS += src/plumbing/tsfix.c \
 	src/plumbing/globalheaders.c
@@ -132,6 +203,9 @@ SRCS += src/plumbing/tsfix.c \
 SRCS += src/dvr/dvr_db.c \
 	src/dvr/dvr_rec.c \
 	src/dvr/dvr_autorec.c \
+	src/dvr/dvr_timerec.c \
+	src/dvr/dvr_config.c \
+	src/dvr/dvr_cutpoints.c \
 
 SRCS += src/webui/webui.c \
 	src/webui/comet.c \
@@ -139,6 +213,7 @@ SRCS += src/webui/webui.c \
 	src/webui/simpleui.c \
 	src/webui/statedump.c \
 	src/webui/html.c\
+	src/webui/webui_api.c\
 
 SRCS += src/muxer.c \
 	src/muxer/muxer_pass.c \
@@ -150,63 +225,143 @@ SRCS += src/muxer.c \
 # Optional code
 #
 
+# MPEGTS core, order by usage (psi lib, tsdemux)
+SRCS-$(CONFIG_MPEGTS) += \
+	src/descrambler/descrambler.c \
+	src/descrambler/caclient.c \
+	src/input/mpegts.c \
+	src/input/mpegts/mpegts_pid.c \
+	src/input/mpegts/mpegts_input.c \
+	src/input/mpegts/tsdemux.c \
+	src/input/mpegts/dvb_psi_lib.c \
+	src/input/mpegts/mpegts_network.c \
+	src/input/mpegts/mpegts_mux.c \
+	src/input/mpegts/mpegts_service.c \
+	src/input/mpegts/mpegts_table.c \
+	src/input/mpegts/dvb_support.c \
+	src/input/mpegts/dvb_charset.c \
+	src/input/mpegts/dvb_psi.c \
+	src/input/mpegts/fastscan.c \
+	src/input/mpegts/mpegts_mux_sched.c \
+        src/input/mpegts/mpegts_network_scan.c
+
+# MPEGTS DVB
+SRCS-${CONFIG_MPEGTS_DVB} += \
+        src/input/mpegts/mpegts_network_dvb.c \
+        src/input/mpegts/mpegts_mux_dvb.c \
+        src/input/mpegts/scanfile.c
+
+# MPEGTS EPG
+SRCS-$(CONFIG_MPEGTS) += \
+	src/epggrab/otamux.c\
+	src/epggrab/module/eit.c \
+	src/epggrab/support/freesat_huffman.c \
+	src/epggrab/module/opentv.c \
+
+# LINUX DVB
+SRCS-${CONFIG_LINUXDVB} += \
+        src/input/mpegts/linuxdvb/linuxdvb.c \
+        src/input/mpegts/linuxdvb/linuxdvb_adapter.c \
+        src/input/mpegts/linuxdvb/linuxdvb_frontend.c \
+        src/input/mpegts/linuxdvb/linuxdvb_satconf.c \
+        src/input/mpegts/linuxdvb/linuxdvb_lnb.c \
+        src/input/mpegts/linuxdvb/linuxdvb_switch.c \
+        src/input/mpegts/linuxdvb/linuxdvb_rotor.c \
+        src/input/mpegts/linuxdvb/linuxdvb_en50494.c
+
+# SATIP Client
+SRCS-${CONFIG_SATIP_CLIENT} += \
+	src/input/mpegts/satip/satip.c \
+	src/input/mpegts/satip/satip_frontend.c \
+	src/input/mpegts/satip/satip_satconf.c \
+	src/input/mpegts/satip/satip_rtsp.c
+
+# HDHOMERUN
+SRCS_HDHOMERUN = \
+        src/input/mpegts/tvhdhomerun/tvhdhomerun.c \
+        src/input/mpegts/tvhdhomerun/tvhdhomerun_frontend.c
+SRCS-${CONFIG_HDHOMERUN_CLIENT} += $(SRCS_HDHOMERUN)
+
+# IPTV
+SRCS-${CONFIG_IPTV} += \
+	src/input/mpegts/iptv/iptv.c \
+        src/input/mpegts/iptv/iptv_mux.c \
+        src/input/mpegts/iptv/iptv_service.c \
+        src/input/mpegts/iptv/iptv_http.c \
+        src/input/mpegts/iptv/iptv_udp.c \
+        src/input/mpegts/iptv/iptv_pipe.c
+
+# TSfile
+SRCS-$(CONFIG_TSFILE) += \
+        src/input/mpegts/tsfile/tsfile.c \
+        src/input/mpegts/tsfile/tsfile_input.c \
+        src/input/mpegts/tsfile/tsfile_mux.c \
+
 # Timeshift
 SRCS-${CONFIG_TIMESHIFT} += \
-  src/timeshift.c \
-  src/timeshift/timeshift_filemgr.c \
-  src/timeshift/timeshift_writer.c \
-  src/timeshift/timeshift_reader.c \
-
-# DVB
-SRCS-${CONFIG_LINUXDVB} += \
-	src/dvb/dvb.c \
-	src/dvb/dvb_support.c \
-	src/dvb/dvb_charset.c \
-	src/dvb/dvb_fe.c \
-	src/dvb/dvb_tables.c \
-	src/dvb/diseqc.c \
-	src/dvb/dvb_adapter.c \
-	src/dvb/dvb_multiplex.c \
-	src/dvb/dvb_service.c \
-	src/dvb/dvb_preconf.c \
-	src/dvb/dvb_satconf.c \
-	src/dvb/dvb_input_filtered.c \
-	src/dvb/dvb_input_raw.c \
-	src/webui/extjs_dvb.c \
-	src/muxes.c \
+	src/timeshift.c \
+	src/timeshift/timeshift_filemgr.c \
+	src/timeshift/timeshift_writer.c \
+	src/timeshift/timeshift_reader.c \
 
 # Inotify
 SRCS-${CONFIG_INOTIFY} += \
-  src/dvr/dvr_inotify.c \
-
-# V4L
-SRCS-${CONFIG_V4L} += \
-	src/v4l.c \
-	src/webui/extjs_v4l.c \
+	src/dvr/dvr_inotify.c \
 
 # Avahi
 SRCS-$(CONFIG_AVAHI) += src/avahi.c
 
+# Bonjour
+SRCS-$(CONFIG_BONJOUR) += src/bonjour.c
+
 # libav
-SRCS-$(CONFIG_LIBAV) += src/libav.c \
+SRCS_LIBAV = \
+	src/libav.c \
 	src/muxer/muxer_libav.c \
-	src/plumbing/transcoding.c \
+	src/plumbing/transcoding.c
+SRCS-$(CONFIG_LIBAV) += $(SRCS_LIBAV)
+
+# Tvhcsa
+SRCS-${CONFIG_TVHCSA} += \
+	src/descrambler/tvhcsa.c
 
 # CWC
-SRCS-${CONFIG_CWC} += src/cwc.c \
-	src/capmt.c
+SRCS-${CONFIG_CWC} += \
+	src/descrambler/cwc.c \
+	
+# CAPMT
+SRCS-${CONFIG_CAPMT} += \
+	src/descrambler/capmt.c
+
+# CONSTCW
+SRCS-${CONFIG_CONSTCW} += \
+	src/descrambler/constcw.c
+
+# TSDEBUGCW
+SRCS-${CONFIG_TSDEBUG} += \
+	src/descrambler/tsdebugcw.c
 
 # FFdecsa
 ifneq ($(CONFIG_DVBCSA),yes)
-SRCS-${CONFIG_CWC}  += src/ffdecsa/ffdecsa_interface.c \
-	src/ffdecsa/ffdecsa_int.c
-ifeq ($(CONFIG_CWC),yes)
-SRCS-${CONFIG_MMX}  += src/ffdecsa/ffdecsa_mmx.c
-SRCS-${CONFIG_SSE2} += src/ffdecsa/ffdecsa_sse2.c
+FFDECSA-$(CONFIG_CAPMT)   = yes
+FFDECSA-$(CONFIG_CWC)     = yes
+FFDECSA-$(CONFIG_CONSTCW) = yes
 endif
-${BUILDDIR}/src/ffdecsa/ffdecsa_mmx.o  : CFLAGS += -mmmx
-${BUILDDIR}/src/ffdecsa/ffdecsa_sse2.o : CFLAGS += -msse2
+
+ifeq ($(FFDECSA-yes),yes)
+SRCS-yes += src/descrambler/ffdecsa/ffdecsa_interface.c \
+	    src/descrambler/ffdecsa/ffdecsa_int.c
+SRCS-${CONFIG_MMX}  += src/descrambler/ffdecsa/ffdecsa_mmx.c
+SRCS-${CONFIG_SSE2} += src/descrambler/ffdecsa/ffdecsa_sse2.c
+${BUILDDIR}/src/descrambler/ffdecsa/ffdecsa_mmx.o  : CFLAGS += -mmmx
+${BUILDDIR}/src/descrambler/ffdecsa/ffdecsa_sse2.o : CFLAGS += -msse2
 endif
+
+# libaesdec
+SRCS-${CONFIG_SSL} += src/descrambler/libaesdec/libaesdec.c
+
+# DBUS
+SRCS-${CONFIG_DBUS_1}  += src/dbus.c
 
 # File bundles
 SRCS-${CONFIG_BUNDLE}     += bundle.c
@@ -214,6 +369,7 @@ BUNDLES-yes               += docs/html docs/docresources src/webui/static
 BUNDLES-yes               += data/conf
 BUNDLES-${CONFIG_DVBSCAN} += data/dvb-scan
 BUNDLES                    = $(BUNDLES-yes)
+ALL-$(CONFIG_DVBSCAN)     += check_dvb_scan
 
 #
 # Add-on modules
@@ -230,12 +386,19 @@ OBJS       = $(SRCS:%.c=$(BUILDDIR)/%.o)
 OBJS_EXTRA = $(SRCS_EXTRA:%.c=$(BUILDDIR)/%.so)
 DEPS       = ${OBJS:%.o=%.d}
 
+ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
+DEPS      += ${BUILDDIR}/libffmpeg_stamp
+endif
+ifeq ($(CONFIG_HDHOMERUN_STATIC),yes)
+DEPS      += ${BUILDDIR}/libhdhomerun_stamp
+endif
+
 #
 # Build Rules
 #
 
 # Default
-all: ${PROG}
+all: $(ALL-yes) ${PROG}
 
 # Special
 .PHONY:	clean distclean check_config reconfigure
@@ -270,6 +433,8 @@ clean:
 	find . -name "*~" | xargs rm -f
 
 distclean: clean
+	rm -rf ${ROOTDIR}/libav_static
+	rm -rf ${ROOTDIR}/libhdhomerun_static
 	rm -rf ${ROOTDIR}/build.*
 	rm -f ${ROOTDIR}/.config.mk
 
@@ -290,6 +455,57 @@ $(BUILDDIR)/bundle.o: $(BUILDDIR)/bundle.c
 	@mkdir -p $(dir $@)
 	$(CC) -I${ROOTDIR}/src -c -o $@ $<
 
-$(BUILDDIR)/bundle.c:
+$(BUILDDIR)/bundle.c: check_dvb_scan
 	@mkdir -p $(dir $@)
 	$(MKBUNDLE) -o $@ -d ${BUILDDIR}/bundle.d $(BUNDLE_FLAGS) $(BUNDLES:%=$(ROOTDIR)/%)
+
+# Static FFMPEG
+
+ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
+${ROOTDIR}/src/libav.h: ${BUILDDIR}/libffmpeg_stamp
+${SRCS_LIBAV}: ${BUILDDIR}/libffmpeg_stamp
+endif
+
+${BUILDDIR}/libffmpeg_stamp: ${ROOTDIR}/libav_static/build/ffmpeg/lib/libavcodec.a
+	@touch $@
+
+${ROOTDIR}/libav_static/build/ffmpeg/lib/libavcodec.a:
+	CONFIG_LIBFFMPEG_STATIC_X264=$(CONFIG_LIBFFMPEG_STATIC_X264) \
+	  $(MAKE) -f Makefile.ffmpeg build
+
+# Static HDHOMERUN library
+
+ifeq ($(CONFIG_LIBHDHOMERUN_STATIC),yes)
+${ROOTDIR}/src/input/mpegts/tvhdhomerun/tvhdhomerun_private.h: ${BUILDDIR}/libhdhomerun_stamp
+${SRCS_HDHOMERUN}: ${BUILDDIR}/libhdhomerun_stamp
+endif
+
+${BUILDDIR}/libhdhomerun_stamp: ${ROOTDIR}/libhdhomerun_static/libhdhomerun/libhdhomerun.a
+	@touch $@
+
+${ROOTDIR}/libhdhomerun_static/libhdhomerun/libhdhomerun.a:
+	$(MAKE) -f Makefile.hdhomerun build
+
+# linuxdvb git tree
+$(ROOTDIR)/data/dvb-scan/.stamp:
+	@echo "Receiving data/dvb-scan/dvb-t from http://linuxtv.org/git/dtv-scan-tables.git"
+	@rm -rf $(ROOTDIR)/data/dvb-scan/*
+	@$(ROOTDIR)/support/getmuxlist $(ROOTDIR)/data/dvb-scan
+	@touch $@
+
+.PHONY: check_dvb_scan
+check_dvb_scan: $(ROOTDIR)/data/dvb-scan/.stamp
+
+# dvb-s / enigma2 / satellites.xml
+$(ROOTDIR)/data/dvb-scan/dvb-s/.stamp: $(ROOTDIR)/data/satellites.xml \
+                                       $(ROOTDIR)/data/dvb-scan/.stamp
+	@echo "Generating data/dvb-scan/dvb-s from data/satellites.xml"
+	@if ! test -s $(ROOTDIR)/data/satellites.xml ; then echo "Put your satellites.xml file to $(ROOTDIR)/data/satellites.xml"; exit 1; fi
+	@if ! test -d $(ROOTDIR)/data/dvb-scan/dvb-s ; then mkdir $(ROOTDIR)/data/dvb-scan/dvb-s ; fi
+	@rm -rf $(ROOTDIR)/data/dvb-scan/dvb-s/*
+	@$(ROOTDIR)/support/sat_xml_scan.py \
+		$(ROOTDIR)/data/satellites.xml $(ROOTDIR)/data/dvb-scan/dvb-s
+	@touch $(ROOTDIR)/data/dvb-scan/dvb-s/.stamp
+
+.PHONY: satellites_xml
+satellites_xml: $(ROOTDIR)/data/dvb-scan/dvb-s/.stamp
